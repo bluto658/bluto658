@@ -1,0 +1,10 @@
+data/raw/
+data/processed/
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+.env
+*.parquet
+*.pickle
+*.pkl
+.DS_Store
