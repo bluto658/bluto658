@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from tqdm.auto import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,28 @@ def _batch(lst: list, size: int):
         yield lst[i : i + size]
 
 
+def test_connection() -> bool:
+    """
+    Quick Bloomberg connectivity check.
+    Fetches one field for SPY and prints a clear pass/fail message.
+    Call this before any data download to confirm Terminal is connected.
+    """
+    print("Testing Bloomberg connection...", flush=True)
+    try:
+        blp = _bbg_import()
+        result = blp.bdp(["SPY US Equity"], "SHORT_NAME")
+        name = result["short_name"].iloc[0]
+        print(f"  Bloomberg connected — SPY returned: '{name}'")
+        return True
+    except ImportError as e:
+        print(f"  FAILED — xbbg not installed: {e}")
+        return False
+    except Exception as e:
+        print(f"  FAILED — could not reach Bloomberg Terminal: {e}")
+        print("  Make sure Bloomberg Terminal is open and you are logged in.")
+        return False
+
+
 def get_universe(
     index: str = "RAY Index",
     min_market_cap_mm: float = 100,
@@ -72,31 +95,37 @@ def get_universe(
     """
     cache_path = _cache(f"universe_{index.replace(' ', '_')}_mc{int(min_market_cap_mm)}")
     if use_cache and _is_fresh(cache_path, cache_days):
-        logger.info("Loading universe from cache")
-        return pd.read_parquet(cache_path)["ticker"].tolist()
+        tickers = pd.read_parquet(cache_path)["ticker"].tolist()
+        print(f"  Universe loaded from cache: {len(tickers):,} tickers")
+        return tickers
 
     blp = _bbg_import()
 
-    logger.info(f"Fetching index members: {index}")
+    print(f"Fetching index members: {index} ...", flush=True)
     members = blp.bds(index, "INDX_MEMBERS")
     raw_tickers = members["member_ticker_and_exch_code"].str.strip().tolist()
     tickers = [f"{t} Equity" for t in raw_tickers]
+    print(f"  {len(tickers):,} index members found")
 
-    logger.info(f"Filtering {len(tickers)} tickers to mkt cap >= ${min_market_cap_mm}M")
+    print(f"Filtering to market cap >= ${min_market_cap_mm}M ...", flush=True)
+    batches = list(_batch(tickers, 200))
     valid: list[str] = []
-    for batch in _batch(tickers, 200):
-        try:
-            caps = blp.bdp(batch, "CUR_MKT_CAP")
-            threshold = min_market_cap_mm * 1e6
-            above = caps[caps["cur_mkt_cap"].fillna(0) >= threshold].index.tolist()
-            valid.extend(above)
-        except Exception as exc:
-            logger.warning(f"Market cap batch failed, including all: {exc}")
-            valid.extend(batch)
-        time.sleep(0.3)
+
+    with tqdm(batches, desc="  Market cap filter", unit="batch") as pbar:
+        for batch in pbar:
+            try:
+                caps = blp.bdp(batch, "CUR_MKT_CAP")
+                threshold = min_market_cap_mm * 1e6
+                above = caps[caps["cur_mkt_cap"].fillna(0) >= threshold].index.tolist()
+                valid.extend(above)
+                pbar.set_postfix({"kept": len(valid)})
+            except Exception as exc:
+                logger.warning(f"Market cap batch failed, including all: {exc}")
+                valid.extend(batch)
+            time.sleep(0.3)
 
     pd.DataFrame({"ticker": valid}).to_parquet(cache_path)
-    logger.info(f"Universe: {len(valid)} tickers above ${min_market_cap_mm}M market cap")
+    print(f"  Universe: {len(valid):,} tickers above ${min_market_cap_mm}M  (saved to cache)")
     return valid
 
 
@@ -118,32 +147,37 @@ def get_price_history(
     safe_key = f"prices_{periodicity}_{start_date}_{end_date}_{len(tickers)}t"
     cache_path = _cache(safe_key)
     if use_cache and cache_path.exists():
-        logger.info("Loading price history from cache")
-        return pd.read_parquet(cache_path)
+        prices = pd.read_parquet(cache_path)
+        print(f"  Prices loaded from cache: {prices.shape[0]} weeks x {prices.shape[1]:,} tickers")
+        return prices
 
     blp = _bbg_import()
     per_code = periodicity[0].upper()  # W or M
     all_dfs: list[pd.DataFrame] = []
+    batches = list(_batch(tickers, 200))
 
-    for i, batch in enumerate(_batch(tickers, 200)):
-        logger.info(f"Price download batch {i + 1} / {len(tickers) // 200 + 1}")
-        try:
-            raw = blp.bdh(
-                batch,
-                "PX_LAST",
-                start_date,
-                end_date,
-                Per=per_code,
-                Fill="P",           # carry forward on non-trading days
-                CshAdjNormal=True,  # adjust for regular dividends/splits
-                CshAdjAbnormal=True,
-            )
-            # xbbg returns MultiIndex columns (ticker, field); drop the field level
-            raw.columns = raw.columns.droplevel(1)
-            all_dfs.append(raw)
-        except Exception as exc:
-            logger.warning(f"Price batch {i} failed: {exc}")
-        time.sleep(0.4)
+    print(f"Downloading {periodicity.lower()} prices: {start_date} → {end_date}", flush=True)
+    print(f"  {len(tickers):,} tickers  |  {len(batches)} batches of 200")
+
+    with tqdm(batches, desc="  Price download", unit="batch") as pbar:
+        for batch in pbar:
+            try:
+                raw = blp.bdh(
+                    batch,
+                    "PX_LAST",
+                    start_date,
+                    end_date,
+                    Per=per_code,
+                    Fill="P",           # carry forward on non-trading days
+                    CshAdjNormal=True,  # adjust for regular dividends/splits
+                    CshAdjAbnormal=True,
+                )
+                raw.columns = raw.columns.droplevel(1)
+                all_dfs.append(raw)
+                pbar.set_postfix({"tickers_so_far": sum(d.shape[1] for d in all_dfs)})
+            except Exception as exc:
+                logger.warning(f"Price batch failed: {exc}")
+            time.sleep(0.4)
 
     if not all_dfs:
         raise RuntimeError("No price data was returned from Bloomberg.")
@@ -152,12 +186,11 @@ def get_price_history(
     prices.index = pd.to_datetime(prices.index)
     prices = prices.sort_index()
 
-    # Remove tickers that are mostly empty
     missing = prices.isnull().mean()
     prices = prices.loc[:, missing <= max_missing_pct]
-    logger.info(f"Retained {prices.shape[1]} tickers after missing-data filter")
 
     prices.to_parquet(cache_path)
+    print(f"  Done: {prices.shape[0]} weeks x {prices.shape[1]:,} tickers  (saved to cache)")
     return prices
 
 
@@ -176,26 +209,31 @@ def get_fundamentals(
 
     cache_path = _cache(f"fundamentals_{len(tickers)}t")
     if use_cache and _is_fresh(cache_path, cache_days):
-        logger.info("Loading fundamentals from cache")
-        return pd.read_parquet(cache_path)
+        df = pd.read_parquet(cache_path)
+        print(f"  Fundamentals loaded from cache: {df.shape[0]:,} tickers x {df.shape[1]} fields")
+        return df
 
     blp = _bbg_import()
     all_dfs: list[pd.DataFrame] = []
+    batches = list(_batch(tickers, 200))
 
-    for i, batch in enumerate(_batch(tickers, 200)):
-        logger.info(f"Fundamentals batch {i + 1} / {len(tickers) // 200 + 1}")
-        try:
-            data = blp.bdp(batch, fields)
-            all_dfs.append(data)
-        except Exception as exc:
-            logger.warning(f"Fundamentals batch {i} failed: {exc}")
-        time.sleep(0.3)
+    print(f"Downloading fundamentals for {len(tickers):,} tickers ...", flush=True)
+
+    with tqdm(batches, desc="  Fundamentals", unit="batch") as pbar:
+        for batch in pbar:
+            try:
+                data = blp.bdp(batch, fields)
+                all_dfs.append(data)
+            except Exception as exc:
+                logger.warning(f"Fundamentals batch failed: {exc}")
+            time.sleep(0.3)
 
     if not all_dfs:
         raise RuntimeError("No fundamental data returned from Bloomberg.")
 
     fundamentals = pd.concat(all_dfs)
     fundamentals.to_parquet(cache_path)
+    print(f"  Done: {fundamentals.shape[0]:,} tickers  (saved to cache)")
     return fundamentals
 
 
@@ -210,9 +248,11 @@ def get_market_factor(
     if end_date is None:
         end_date = datetime.today().strftime("%Y%m%d")
 
+    print(f"Fetching market factor ({proxy_ticker}) ...", flush=True)
     prices = get_price_history(
         [proxy_ticker], start_date, end_date, periodicity, use_cache
     )
     returns = prices.squeeze().pct_change().dropna()
     returns.name = "market"
+    print(f"  Market factor: {len(returns)} weekly observations")
     return returns
